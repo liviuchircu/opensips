@@ -2,8 +2,9 @@
  * $Id$ 
  */
 
-#ifndef __DB_KEY_H__
-#define __DB_KEY_H__
+#ifndef DB_KEY_H
+#define DB_KEY_H
+
 
 /*
  * Type of a database key (column)
