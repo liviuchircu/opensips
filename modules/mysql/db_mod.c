@@ -35,7 +35,9 @@
 
 #include "../../sr_module.h"
 #include "dbase.h"
+#include "db_mod.h"
 
+int ping_interval = 5 * 60; /* Default is 5 minutes */
 
 MODULE_VERSION
 
@@ -57,13 +59,22 @@ static cmd_export_t cmds[] = {
 };
 
 
+/*
+ * Exported parameters
+ */
+static param_export_t params[] = {
+	{"ping_interval", INT_PARAM },
+	{0, 0, 0}
+};
+
+
 struct module_exports exports = {	
 	"mysql",
 	cmds,
-	0,   /*  module paramers */
-	0,   /* module initialization function */
-	0,   /* response function*/
-	0,   /* destroy function */
-	0,   /* oncancel function */
-	0    /* per-child init function */
+	params, /*  module paramers */
+	0,      /* module initialization function */
+	0,      /* response function*/
+	0,      /* destroy function */
+	0,      /* oncancel function */
+	0       /* per-child init function */
 };
