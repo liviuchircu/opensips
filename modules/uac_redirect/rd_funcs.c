@@ -163,7 +163,6 @@ static int shmcontact2dset(struct sip_msg *req, struct sip_msg *sh_rpl, long max
 	struct hdr_field *hdr;
 	struct hdr_field *contact_hdr;
 	contact_t        *contacts;
-	struct msg_branch branch;
 	int n,i;
 	int added;
 	int dup;
@@ -260,10 +259,7 @@ static int shmcontact2dset(struct sip_msg *req, struct sip_msg *sh_rpl, long max
 			}
 			set_ruri_q(req, sqvalues[i]);
 		} else {
-			memset( &branch, 0, sizeof branch);
-			branch.uri = scontacts[i];
-			branch.q = sqvalues[i];
-			if (append_msg_branch(&branch)<0) {
+			if (append_branch(0,&scontacts[i],0,0,sqvalues[i],0,0)<0) {
 				LM_ERR("failed to add contact to dset\n");
 				continue;
 			}

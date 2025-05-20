@@ -2478,10 +2478,11 @@ str* create_top_hiding_entities(struct sip_msg* msg, b2bl_cback_f cbf,
 	str to_uri={NULL, 0}, from_uri, from_dname;
 	b2bl_entity_id_t* client_entity = NULL;
 	int idx;
+	str uri;
+	qvalue_t q;
 	str from_tag_gen= {0, 0};
 	str new_body={0, 0};
 	struct sip_uri ct_uri;
-	struct msg_branch *branch;
 	int maxfwd;
 
 	if (!str_match((_str("INVITE")), &msg->first_line.u.request.method)) {
@@ -2644,13 +2645,12 @@ str* create_top_hiding_entities(struct sip_msg* msg, b2bl_cback_f cbf,
 		goto error;
 	}
 
-	for( idx=0 ; (branch=get_msg_branch(idx))!=NULL ; idx++ )
+	for( idx=0 ; (uri.s=get_branch(idx,&uri.len,&q,0,0,0,0))!=0 ; idx++ )
 	{
-		LM_DBG("got branch ruri [%.*s]\n", branch->uri.len, branch->uri.s);
-		gen_fromtag(&dlginfo->callid, &dlginfo->fromtag, &branch->uri,
-			msg, &from_tag_gen);
+		LM_DBG("got branch ruri [%.*s]\n", uri.len, uri.s);
+		gen_fromtag(&dlginfo->callid, &dlginfo->fromtag, &uri, msg, &from_tag_gen);
 		ci.from_tag = &from_tag_gen;
-		ci.req_uri = branch->uri;
+		ci.req_uri = uri;
 		ci.avps = clone_avp_list( *get_avp_list() );
 
 		client_id = b2b_api.client_new(&ci, b2b_client_notify, b2b_add_dlginfo,

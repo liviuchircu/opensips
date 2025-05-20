@@ -214,8 +214,6 @@ err_server:
 
 static inline int set_alias_to_ruri(struct sip_msg* _msg, str *alias, int no, pv_spec_t *p)
 {
-	struct msg_branch branch;
-
 	/* set the RURI */
 	if(no==0) {
 		if(set_ruri(_msg, alias)<0) {
@@ -223,10 +221,7 @@ static inline int set_alias_to_ruri(struct sip_msg* _msg, str *alias, int no, pv
 			return -1;
 		}
 	} else if (ald_append_branches) {
-		memset( &branch, 0, sizeof branch);
-		branch.uri = *alias;
-		branch.q = MIN_Q;
-		if (append_msg_branch(&branch) == -1) {
+		if (append_branch(_msg, alias, 0, 0, MIN_Q, 0, 0) == -1) {
 			LM_ERR("error while appending branches\n");
 			return -1;
 		}

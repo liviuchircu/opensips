@@ -88,31 +88,32 @@ int init_serialization(void)
 int serialize_branches(struct sip_msg *msg, int clean_before, int keep_order)
 {
 	static struct serial_contact contacts[MAX_BRANCHES];
-	struct msg_branch *branch;
-	int n, last, first, i, prev, bflags;
-	str *ruri;
-	qvalue_t ruri_q;
+	int n, last, first, i, prev;
+	str branch, *ruri;
+	qvalue_t q, ruri_q;
 	char *p;
-	str enc_info;
+	str dst_uri, path, enc_info;
+	unsigned int flags;
+	const struct socket_info *sock_info;
 	int_str val;
 	int idx;
 
 	/* Check if anything needs to be done */
-	if (get_dset_size() == 0) {
+	if (get_nr_branches() == 0) {
 		LM_DBG("nothing to do - no branches!\n");
 		return 0;
 	}
 
 	ruri = GET_RURI(msg);
 	ruri_q = get_ruri_q(msg);
-	bflags = getb0flags(msg);
+	flags = getb0flags(msg);
 
-	for (idx = 0; (branch = get_msg_branch(idx)); idx++) {
-		if (branch->q != ruri_q)
+	for (idx = 0; (branch.s = get_branch(idx,&branch.len,&q,0,0,0,0)); idx++) {
+		if (q != ruri_q)
 			break;
 	}
 
-	if (branch==NULL && !keep_order) {
+	if (branch.s == 0 && !keep_order) {
 		LM_DBG("nothing to do - all same q!\n");
 		return 0;
 	}
@@ -137,11 +138,11 @@ int serialize_branches(struct sip_msg *msg, int clean_before, int keep_order)
 			ruri->len, ruri->s,
 			msg->dst_uri.len, msg->dst_uri.s,
 			msg->path_vec.len, msg->path_vec.s,
-			ruri_q, bflags);
+			ruri_q, flags);
 
 	seras(p, &msg->force_send_socket, long);
 	p += sizeof(long);
-	seras(p, &bflags, long);
+	seras(p, &flags, long);
 	p += sizeof(long);
 	seras(p, &ruri_q, long);
 	p += sizeof(long);
@@ -160,10 +161,11 @@ int serialize_branches(struct sip_msg *msg, int clean_before, int keep_order)
 	n++;
 
 	/* Insert branch URIs to contact list in increasing q order */
-	for (idx = 0;(branch=get_msg_branch(idx))!=NULL; idx++){
+	for (idx = 0;(branch.s = get_branch(idx, &branch.len, &q,
+					&dst_uri, &path, &flags, &sock_info)); idx++){
 
 		enc_info.len = 3 * sizeof(long)
-			+ branch->uri.len + branch->dst_uri.len + branch->path.len + 3;
+						+ branch.len + dst_uri.len + path.len + 3;
 		enc_info.s = (char*) pkg_malloc (enc_info.len);
 
 		if (!enc_info.s) {
@@ -175,26 +177,26 @@ int serialize_branches(struct sip_msg *msg, int clean_before, int keep_order)
 		p = enc_info.s;
 
 		LM_DBG("Branch information <%.*s,%.*s,%.*s,%d,%u>\n",
-				branch->uri.len, branch->uri.s,
-				branch->dst_uri.len, branch->dst_uri.s,
-				branch->path.len, branch->path.s,
-				branch->q, branch->bflags);
+				branch.len, branch.s,
+				dst_uri.len, dst_uri.s,
+				path.len, path.s,
+				q, flags);
 
-		seras(p, &branch->force_send_socket, long);
+		seras(p, &sock_info, long);
 		p += sizeof(long);
-		seras(p, &branch->bflags, long);
+		seras(p, &flags, long);
 		p += sizeof(long);
-		seras(p, &branch->q, long);
+		seras(p, &q, long);
 		p += sizeof(long);
 
-		memcpy(p , branch->uri.s, branch->uri.len);
-		p += branch->uri.len + 1;
-		memcpy(p, branch->dst_uri.s, branch->dst_uri.len);
-		p += branch->dst_uri.len + 1;
-		memcpy(p, branch->path.s, branch->path.len);
+		memcpy(p , branch.s, branch.len);
+		p += branch.len + 1;
+		memcpy(p, dst_uri.s, dst_uri.len);
+		p += dst_uri.len + 1;
+		memcpy(p, path.s, path.len);
 
 		contacts[n].enc_info = enc_info;
-		contacts[n].q = branch->q;
+		contacts[n].q = q;
 
 		if (keep_order) {
 			contacts[n].next = first;
@@ -204,8 +206,7 @@ int serialize_branches(struct sip_msg *msg, int clean_before, int keep_order)
 
 		/* insert based on ascending q values, so add_avp() reverses them */
 		for (i = first, prev = -1;
-			i != -1 && contacts[i].q < branch->q;
-			prev = i ,i = contacts[i].next);
+		     i != -1 && contacts[i].q < q; prev = i ,i = contacts[i].next);
 
 		if (i == -1) {
 			/* append */
@@ -251,7 +252,7 @@ int serialize_branches(struct sip_msg *msg, int clean_before, int keep_order)
 	}
 
 	/* Clear all branches */
-	clear_dset();
+	clear_branches();
 
 	return 0;
 error_free:
@@ -274,7 +275,6 @@ error:
  */
 int next_branches( struct sip_msg *msg)
 {
-	struct msg_branch branch;
 	struct usr_avp *avp, *prev;
 	int_str val;
 	struct socket_info *sock_info;
@@ -371,31 +371,31 @@ int next_branches( struct sip_msg *msg)
 			goto next_avp;
 		}
 
-		memset( &branch, 0, sizeof branch);
 		p = val.s.s;
-		unseras(&branch.force_send_socket, p, long);
+		unseras(&sock_info, p, long);
 		p += sizeof(long);
-		unseras(&branch.bflags, p, long);
+		unseras(&flags, p, long);
 		p += sizeof(long);
-		unseras(&branch.q, p, long);
+		unseras(&q, p, long);
 		p += sizeof(long);
-		branch.uri.s = p;
-		branch.uri.len = strlen(p);
+		uri.s = p;
+		uri.len = strlen(p);
 		p += strlen(p) + 1;
-		branch.dst_uri.s = p;
-		branch.dst_uri.len = strlen(p);
+		dst_uri.s = p;
+		dst_uri.len = strlen(p);
 		p += strlen(p) + 1;
-		branch.path.s = p;
-		branch.path.len = strlen(p);
+		path.s = p;
+		path.len = strlen(p);
 
 		LM_DBG("Branch information <%.*s,%.*s,%.*s,%d,%u> (avp flag=%u)\n",
-				branch.uri.len, branch.uri.s,
-				branch.dst_uri.len, branch.dst_uri.s,
-				branch.path.len, branch.path.s,
-				branch.q, branch.bflags, avp->flags);
+				uri.len, uri.s,
+				dst_uri.len, dst_uri.s,
+				path.len, path.s,
+				q, flags, avp->flags);
 
 
-		rval = append_msg_branch(&branch);
+		rval = append_branch(msg, &uri, &dst_uri, &path,
+				q, flags, sock_info);
 
 		if (rval == -1) {
 			LM_ERR("append_branch failed\n");

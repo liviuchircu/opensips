@@ -174,7 +174,7 @@ int receive_msg(char* buf, unsigned int len, struct receive_info* rcv_info,
 	 * start_expire_timer() is still on */
 
 	/* ... clear branches from previous message */
-	clear_dset();
+	clear_branches();
 
 	if (msg->first_line.type==SIP_REQUEST) {
 		update_stat( rcv_reqs, 1);

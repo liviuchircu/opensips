@@ -53,7 +53,9 @@ lookup_rc lookup(struct sip_msg *req, udomain_t *d,
 {
 	static char urimem[MAX_BRANCHES-1][MAX_URI_SIZE];
 	static str branch_uris[MAX_BRANCHES-1];
-	int idx = 0, nbranches = 0;
+	int idx = 0, nbranches = 0, tlen;
+	char *turi;
+	qvalue_t tq;
 	urecord_t* r;
 	str aor;
 	ucontact_t *ct, **ptr, **pn_cts, **cts;
@@ -62,7 +64,6 @@ lookup_rc lookup(struct sip_msg *req, udomain_t *d,
 	int rc, ret = LOOKUP_NO_RESULTS, have_pn_cts = 0, single_branch = 0;
 	str sip_instance = STR_NULL, call_id = STR_NULL;
 	regex_t *ua_re = NULL;
-	struct msg_branch *branch;
 
 	if (!req->callid) {
 		LM_ERR("bad %.*s request (missing Call-ID header)\n",
@@ -81,12 +82,14 @@ lookup_rc lookup(struct sip_msg *req, udomain_t *d,
 
 	if (flags & REG_BRANCH_AOR_LOOKUP_FLAG) {
 		/* extract all the branches for further usage */
-		while ( (branch=get_msg_branch(nbranches))!=NULL ) {
+		while (
+			(turi=get_branch(nbranches, &tlen, &tq, NULL, NULL, NULL, NULL))
+				) {
 			/* copy uri */
 			branch_uris[nbranches].s = urimem[nbranches];
-			if (branch->uri.len) {
-				memcpy(branch_uris[nbranches].s,branch->uri.s,branch->uri.len);
-				branch_uris[nbranches].len = branch->uri.len;
+			if (tlen) {
+				memcpy(branch_uris[nbranches].s, turi, tlen);
+				branch_uris[nbranches].len = tlen;
 			} else {
 				*branch_uris[nbranches].s  = '\0';
 				branch_uris[nbranches].len = 0;
@@ -94,7 +97,7 @@ lookup_rc lookup(struct sip_msg *req, udomain_t *d,
 
 			nbranches++;
 		}
-		clear_dset();
+		clear_branches();
 	}
 
 	if (!aor_uri)
@@ -458,32 +461,32 @@ int push_branch(struct sip_msg *msg, ucontact_t *ct, int *ruri_is_pushed)
 {
 	str path_dst;
 	int_str istr;
+	str *ct_uri, _ct_uri;
 	struct sip_uri puri;
-	struct msg_branch branch;
 
 	if (!ct)
 		return 1;
-
-	memset( &branch, 0, sizeof branch);
 
 	if (pn_enable && pn_on(ct) && pn_has_uri_params(&ct->c, &puri)) {
 		if (pn_required(ct))
 			return 2;
 
-		if (pn_remove_uri_params(&puri, ct->c.len, &branch.uri) != 0) {
+		if (pn_remove_uri_params(&puri, ct->c.len, &_ct_uri) != 0) {
 			LM_ERR("failed to remove PN URI params\n");
 			return *ruri_is_pushed ? -1 : -2;
 		}
+
+		ct_uri = &_ct_uri;
 	} else {
-		branch.uri = ct->c;
+		ct_uri = &ct->c;
 	}
 
 	if (*ruri_is_pushed)
 		goto append_branch;
 
-	LM_DBG("setting msg R-URI <%.*s>\n", branch.uri.len, branch.uri.s);
+	LM_DBG("setting msg R-URI <%.*s>\n", ct_uri->len, ct_uri->s);
 
-	if (set_ruri(msg, &branch.uri) < 0) {
+	if (set_ruri(msg, ct_uri) < 0) {
 		LM_ERR("unable to rewrite Request-URI\n");
 		return -2;
 	}
@@ -522,15 +525,12 @@ int push_branch(struct sip_msg *msg, ucontact_t *ct, int *ruri_is_pushed)
 	goto add_attr_avp;
 
 append_branch:
-	LM_DBG("setting branch R-URI <%.*s>\n", branch.uri.len, branch.uri.s);
+	LM_DBG("setting branch R-URI <%.*s>\n", ct_uri->len, ct_uri->s);
 
 	if (ct->flags & FL_EXTRA_HOP) {
-		branch.dst_uri = ct->received;
-		branch.path = msg->path_vec;
-		branch.q = msg->ruri_q;
-		branch.force_send_socket = msg->force_send_socket;
-		branch.bflags = msg->ruri_bflags;
-		if (append_msg_branch( &branch) == -1) {
+		if (append_branch(msg, ct_uri, &ct->received, &msg->path_vec,
+		                  get_ruri_q(msg), getb0flags(msg),
+		                  msg->force_send_socket) == -1) {
 			LM_ERR("failed to append a branch\n");
 			return -1;
 		}
@@ -544,12 +544,9 @@ append_branch:
 
 		/* The same as for the first contact applies for branches
 		 * regarding path vs. received. */
-		branch.dst_uri = path_dst.len ? path_dst : ct->received;
-		branch.path = ct->path;
-		branch.q = ct->q;
-		branch.force_send_socket = ct->sock;
-		branch.bflags = ct->cflags;
-		if (append_msg_branch(&branch) == -1) {
+		if (append_branch(msg, ct_uri,
+		           path_dst.len ? &path_dst : &ct->received,
+		           &ct->path, ct->q, ct->cflags, ct->sock) == -1) {
 			LM_ERR("failed to append a branch\n");
 			return -1;
 		}
