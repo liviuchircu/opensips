@@ -460,7 +460,6 @@ int push_branch(struct sip_msg *msg, ucontact_t *ct, int *ruri_is_pushed)
 	int_str istr;
 	struct sip_uri puri;
 	struct msg_branch branch;
-	int br_idx;
 
 	if (!ct)
 		return 1;
@@ -520,7 +519,6 @@ int push_branch(struct sip_msg *msg, ucontact_t *ct, int *ruri_is_pushed)
 	}
 
 	*ruri_is_pushed = 1;
-	br_idx = 0;
 	goto add_attr_avp;
 
 append_branch:
@@ -556,14 +554,11 @@ append_branch:
 			return -1;
 		}
 	}
-	br_idx = get_dset_size(); /*last inserted branch*/
-	/* it should be `-1` to covert form size to index, but we also need to 
-	 * do a `+1` due to re-indexing with RURI branch as first */
 
 add_attr_avp:
 	if (attr_avp_name != -1) {
 		istr.s = ct->attr;
-		if (set_msg_branch_attr(br_idx, attr_avp_name, AVP_VAL_STR, istr)<0)
+		if (add_avp_last(AVP_VAL_STR, attr_avp_name, istr) != 0)
 			LM_ERR("Failed to populate attr avp!\n");
 	}
 
