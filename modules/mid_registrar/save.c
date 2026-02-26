@@ -2216,7 +2216,7 @@ static int process_contacts_by_ct(struct sip_msg *msg, urecord_t *urec,
 			return 1;
 		}
 
-		ret = ul.get_ucontact(urec, &ct->uri, ci->callid, ci->cseq,
+		ret = ul.get_ucontact(urec, &ct->uri, ci->callid, ci->cseq+1,
 			&_sctx->cmatch, &c);
 		if (ret == -1) {
 			LM_ERR("invalid cseq for aor <%.*s>\n",urec->aor.len,urec->aor.s);
@@ -2402,7 +2402,7 @@ static int process_contacts_by_aor(struct sip_msg *req, urecord_t *urec,
 			e = e_out;
 		}
 
-		ret = ul.get_ucontact(urec, &ct->uri, ci->callid, ci->cseq,
+		ret = ul.get_ucontact(urec, &ct->uri, ci->callid, ci->cseq+1,
 			&_sctx->cmatch, &c);
 		if (ret == -1) {
 			LM_ERR("invalid cseq for aor <%.*s>\n",urec->aor.len,urec->aor.s);
