@@ -28,9 +28,13 @@
 #include "../../dprint.h"
 #include "../../config.h"
 #include "../../socket_info.h"
+#include "../../parser/parse_to.h"
 #include "../../parser/parse_methods.h"
+#include "../../parser/parse_rr.h"
+#include "../../parser/contact/parse_contact.h"
 #include "../tm/dlg.h"
 #include "../tm/tm_load.h"
+#include "../tm/t_hooks.h"
 #include "../../ipc.h"
 #include "dlg_hash.h"
 #include "dlg_req_within.h"
@@ -40,6 +44,190 @@
 #include "dlg_replication.h"
 
 extern str dlg_extra_hdrs;
+
+#define DLG_TM_TID_LEN ((sizeof(int) * 2) + 1 + (sizeof(int) * 2))
+
+struct dlg_auto_prack_ctx {
+	unsigned int invite_hash_index;
+	unsigned int invite_label;
+	str invite_tid;
+	str invite_totag;
+};
+
+static void dlg_auto_prack_free(void *ctx)
+{
+	shm_free(ctx);
+}
+
+static void dlg_auto_prack_reply_failure(struct dlg_auto_prack_ctx *ctx)
+{
+	str reason = str_init("Bad Gateway");
+	struct cell *invite_t;
+	int rc;
+
+	if (!auto_prack_hangup_on_failure) {
+		LM_DBG("auto PRACK failure observed for correlated INVITE transaction <%.*s>, but auto_prack_hangup_on_failure is disabled\n",
+			ctx->invite_tid.len, ctx->invite_tid.s);
+		return;
+	}
+
+	rc = d_tmb.t_lookup_ident(&invite_t, ctx->invite_hash_index,
+			ctx->invite_label);
+	if (rc < 0) {
+		LM_ERR("failed to lookup correlated INVITE transaction <%.*s> for auto PRACK failure handling\n",
+			ctx->invite_tid.len, ctx->invite_tid.s);
+		return;
+	}
+
+	LM_DBG("auto PRACK failure: sending native 502 reply on correlated INVITE transaction <%.*s>, to-tag <%.*s>\n",
+		ctx->invite_tid.len, ctx->invite_tid.s,
+		ctx->invite_totag.len, ctx->invite_totag.s);
+	rc = d_tmb.t_reply_with_body(invite_t, 502, &reason, NULL, NULL,
+			&ctx->invite_totag);
+	d_tmb.unref_cell(invite_t);
+
+	if (rc < 0)
+		LM_ERR("failed to send native 502 reply on correlated INVITE transaction <%.*s>\n",
+			ctx->invite_tid.len, ctx->invite_tid.s);
+	else
+		LM_DBG("native 502 reply sent on correlated INVITE transaction <%.*s>\n",
+			ctx->invite_tid.len, ctx->invite_tid.s);
+}
+
+static int dlg_format_trans_id(unsigned int hash_index, unsigned int label,
+		str *out, char *buf, unsigned int size)
+{
+	char *p;
+	int left;
+
+	if (size < DLG_TM_TID_LEN)
+		return -1;
+
+	p = buf;
+	left = size;
+	int2reverse_hex(&p, &left, label);
+	*(p++) = '.';
+	left--;
+	int2reverse_hex(&p, &left, hash_index);
+
+	out->s = buf;
+	out->len = p - buf;
+	return 0;
+}
+
+static void dlg_auto_prack_tmcb(struct cell *t, int type, struct tmcb_params *ps)
+{
+	char prack_tid_buf[DLG_TM_TID_LEN];
+	str prack_tid = STR_NULL;
+	struct dlg_auto_prack_ctx *ctx;
+	int rc = 0;
+
+	if (!ps || !ps->param || !(*ps->param))
+		return;
+
+	ctx = (struct dlg_auto_prack_ctx *)(*ps->param);
+	if (dlg_format_trans_id(t->hash_index, t->label, &prack_tid, prack_tid_buf,
+			sizeof(prack_tid_buf)) < 0) {
+		LM_ERR("failed to format auto PRACK transaction id for [%u:%u]\n",
+			t->hash_index, t->label);
+		return;
+	}
+
+	switch (type) {
+	case TMCB_LOCAL_COMPLETED:
+		LM_DBG("auto PRACK local transaction <%.*s> completed with code %d; correlated INVITE tid <%.*s>, to-tag <%.*s>\n",
+			prack_tid.len, prack_tid.s, ps->code, ctx->invite_tid.len,
+			ctx->invite_tid.s, ctx->invite_totag.len, ctx->invite_totag.s);
+		if (ps->code < 300)
+			break;
+		LM_DBG("auto PRACK local transaction <%.*s> completed negatively with code %d; triggering correlated INVITE failure handling\n",
+			prack_tid.len, prack_tid.s, ps->code);
+		rc = 1;
+		break;
+	case TMCB_ON_FAILURE:
+		LM_DBG("auto PRACK local transaction <%.*s> failed with code %d; correlated INVITE tid <%.*s>, to-tag <%.*s>\n",
+			prack_tid.len, prack_tid.s, ps->code, ctx->invite_tid.len,
+			ctx->invite_tid.s, ctx->invite_totag.len, ctx->invite_totag.s);
+		rc = 1;
+		break;
+	}
+
+	if (rc)
+		dlg_auto_prack_reply_failure(ctx);
+}
+
+static void dlg_auto_prack_t_created(struct cell *t, void *param)
+{
+	char prack_tid_buf[DLG_TM_TID_LEN];
+	str prack_tid = STR_NULL;
+	struct dlg_auto_prack_ctx *ctx = param;
+
+	t->fr_timeout = auto_prack_fr_timeout;
+
+	if (dlg_format_trans_id(t->hash_index, t->label, &prack_tid, prack_tid_buf,
+			sizeof(prack_tid_buf)) < 0) {
+		LM_ERR("failed to format newly created auto PRACK transaction id for [%u:%u]\n",
+			t->hash_index, t->label);
+	} else {
+		LM_DBG("auto PRACK created local transaction <%.*s>; correlated INVITE tid <%.*s>, to-tag <%.*s>; fr_timeout=%d\n",
+			prack_tid.len, prack_tid.s, ctx->invite_tid.len, ctx->invite_tid.s,
+			ctx->invite_totag.len, ctx->invite_totag.s, t->fr_timeout);
+	}
+
+	if (d_tmb.register_tmcb(NULL, t, TMCB_LOCAL_COMPLETED | TMCB_ON_FAILURE,
+			dlg_auto_prack_tmcb, ctx, dlg_auto_prack_free) < 0) {
+		LM_ERR("failed to register TM callbacks for auto PRACK local transaction [%u:%u]\n",
+			t->hash_index, t->label);
+	}
+}
+
+static struct dlg_auto_prack_ctx *dlg_build_auto_prack_ctx(struct sip_msg *rpl)
+{
+	char invite_tid_buf[DLG_TM_TID_LEN];
+	struct dlg_auto_prack_ctx *ctx;
+	unsigned int hash_index, label;
+	unsigned int size;
+	char *p;
+	str invite_tid = STR_NULL;
+	str invite_totag = STR_NULL;
+
+	if (d_tmb.t_get_trans_ident(rpl, &hash_index, &label) < 0) {
+		LM_ERR("failed to fetch correlated INVITE transaction id for auto PRACK\n");
+		return NULL;
+	}
+	if ((!rpl->to && parse_headers(rpl, HDR_TO_F, 0) < 0) || !rpl->to) {
+		LM_ERR("failed to parse To header while building auto PRACK correlation context\n");
+		return NULL;
+	}
+
+	if (dlg_format_trans_id(hash_index, label, &invite_tid, invite_tid_buf,
+			sizeof(invite_tid_buf)) < 0) {
+		LM_ERR("failed to format correlated INVITE transaction id for auto PRACK\n");
+		return NULL;
+	}
+	invite_totag = get_to(rpl)->tag_value;
+
+	size = sizeof(*ctx) + invite_tid.len + invite_totag.len;
+	ctx = shm_malloc(size);
+	if (!ctx) {
+		LM_ERR("oom for auto PRACK correlation context\n");
+		return NULL;
+	}
+
+	p = (char *)(ctx + 1);
+	ctx->invite_hash_index = hash_index;
+	ctx->invite_label = label;
+	ctx->invite_tid.s = p;
+	ctx->invite_tid.len = invite_tid.len;
+	memcpy(p, invite_tid.s, invite_tid.len);
+	p += invite_tid.len;
+
+	ctx->invite_totag.s = p;
+	ctx->invite_totag.len = invite_totag.len;
+	memcpy(p, invite_totag.s, invite_totag.len);
+
+	return ctx;
+}
 
 int free_tm_dlg(dlg_t *td)
 {
@@ -204,6 +392,118 @@ dlg_t * build_dialog_info(struct dlg_cell * cell, int dst_leg, int src_leg,
 	return td;
 
 error:
+	free_tm_dlg(td);
+	return NULL;
+}
+
+static dlg_t *build_prack_dialog_info(struct dlg_cell *cell, struct sip_msg *rpl,
+		int dst_leg, int src_leg, char *reply_marker)
+{
+	dlg_t *td = NULL;
+	str contact = STR_NULL, rr_set = STR_NULL;
+	unsigned int loc_seq = 0;
+	unsigned int skip_rrs = 0;
+	contact_t *ct = NULL;
+	contact_body_t *parsed_body = NULL;
+
+	if ((!rpl->cseq && parse_headers(rpl, HDR_CSEQ_F, 0) < 0) || !rpl->cseq ||
+			!rpl->cseq->parsed) {
+		LM_ERR("bad provisional reply or missing CSeq hdr\n");
+		return NULL;
+	}
+	if ((!rpl->to && parse_headers(rpl, HDR_TO_F, 0) < 0) || !rpl->to) {
+		LM_ERR("bad provisional reply or missing TO hdr\n");
+		return NULL;
+	}
+
+	td = pkg_malloc(sizeof(*td));
+	if (!td) {
+		LM_ERR("out of pkg memory\n");
+		return NULL;
+	}
+	memset(td, 0, sizeof(*td));
+
+	loc_seq = cell->legs[dst_leg].last_gen_cseq;
+	if (loc_seq == 0) {
+		if (str2int(&get_cseq(rpl)->number, &loc_seq) != 0) {
+			LM_ERR("invalid reply cseq\n");
+			goto error;
+		}
+		cell->legs[dst_leg].last_gen_cseq = loc_seq + 1;
+		LM_DBG("initializing PRACK cseq to [%d] from reply cseq\n",
+			cell->legs[dst_leg].last_gen_cseq);
+	} else {
+		cell->legs[dst_leg].last_gen_cseq++;
+		LM_DBG("incrementing PRACK cseq to [%d]\n",
+			cell->legs[dst_leg].last_gen_cseq);
+	}
+	if (reply_marker)
+		*reply_marker = DLG_PING_PENDING;
+
+	td->loc_seq.value = loc_seq;
+	td->loc_seq.is_set = 1;
+
+	if (!rpl->contact &&
+			(parse_headers(rpl, HDR_CONTACT_F, 0) < 0 || !rpl->contact)) {
+		LM_ERR("no contact available in provisional reply\n");
+		goto error;
+	}
+	if (!rpl->contact->parsed) {
+		contact = rpl->contact->body;
+		trim_leading(&contact);
+		if (parse_contacts(&contact, &ct) < 0 || !ct) {
+			LM_ERR("bad Contact hdr in provisional reply\n");
+			goto error;
+		}
+		contact = ct->uri;
+	} else {
+		parsed_body = (contact_body_t *)rpl->contact->parsed;
+		if (parsed_body->star == 1 || !parsed_body->contacts) {
+			LM_ERR("invalid Contact hdr in provisional reply\n");
+			goto error;
+		}
+		contact = parsed_body->contacts->uri;
+	}
+
+	if (parse_headers(rpl, HDR_EOH_F, 0) < 0) {
+		LM_ERR("failed to parse record route headers in provisional reply\n");
+		goto error;
+	}
+	if (rpl->record_route &&
+			print_rr_body(rpl->record_route, &rr_set, 1, 0, &skip_rrs) != 0) {
+		LM_ERR("failed to print route records from provisional reply\n");
+		goto error;
+	}
+	if (rr_set.s && rr_set.len &&
+			parse_rr_body(rr_set.s, rr_set.len, &td->route_set) != 0) {
+		LM_ERR("failed to parse route set from provisional reply\n");
+		goto error;
+	}
+
+	td->rem_target = contact;
+	td->rem_uri = (dst_leg == DLG_CALLER_LEG) ? *dlg_leg_from_uri(cell, dst_leg) :
+			*dlg_leg_to_uri(cell, dst_leg);
+	td->loc_uri = (dst_leg == DLG_CALLER_LEG) ? *dlg_leg_to_uri(cell, dst_leg) :
+			*dlg_leg_from_uri(cell, dst_leg);
+	td->id.call_id = cell->callid;
+	td->id.rem_tag = get_to(rpl)->tag_value;
+	td->id.loc_tag = cell->legs[src_leg].tag;
+	td->state = DLG_CONFIRMED;
+	td->send_sock = rpl->rcv.bind_address ? rpl->rcv.bind_address :
+			cell->legs[dst_leg].bind_addr;
+	td->dialog_ctx = cell;
+
+	if (ct)
+		free_contacts(&ct);
+	if (rr_set.s)
+		pkg_free(rr_set.s);
+	return td;
+
+error:
+	if (ct)
+		free_contacts(&ct);
+	if (rr_set.s)
+		pkg_free(rr_set.s);
 	free_tm_dlg(td);
 	return NULL;
 }
@@ -1012,6 +1312,7 @@ mi_response_t *mi_send_sequential_dlg(const mi_params_t *params,
 struct dlg_indialog_req_param {
 	int leg;
 	int is_invite;
+	int is_prack;
 	struct dlg_cell *dlg;
 	indialog_reply_f func;
 	void *param;
@@ -1089,6 +1390,101 @@ int send_indialog_request(struct dlg_cell *dlg, str *method, int dstleg, str *bo
 		return -2;
 	}
 	pkg_free(extra_headers.s);
+	return 0;
+}
+
+int send_prack_indialog_request(struct dlg_cell *dlg, struct sip_msg *rpl,
+		int dstleg, str *body, str *ct, str *hdrs, indialog_reply_f func,
+		void *param, indialog_release_f release)
+{
+	str method = str_init("PRACK");
+	str extra_headers = STR_NULL;
+	struct dlg_indialog_req_param *p = NULL;
+	struct dlg_auto_prack_ctx *auto_prack_ctx = NULL;
+	context_p old_ctx;
+	context_p *new_ctx;
+	dlg_t *dialog_info = NULL;
+	int result;
+
+	if (!dlg_get_leg_hdrs(dlg, other_leg(dlg, dstleg), dstleg, ct, hdrs,
+			&extra_headers)) {
+		LM_ERR("could not build extra headers!\n");
+		return -1;
+	}
+
+	dialog_info = build_prack_dialog_info(dlg, rpl, dstleg, other_leg(dlg, dstleg),
+			dlg_has_reinvite_pinging(dlg) ?
+			&dlg->legs[dstleg].reinvite_confirmed :
+			&dlg->legs[dstleg].reply_received);
+	if (!dialog_info) {
+		pkg_free(extra_headers.s);
+		LM_ERR("failed to create PRACK dlg_t\n");
+		return -2;
+	}
+
+	p = shm_malloc(sizeof *p);
+	if (!p) {
+		LM_ERR("oom for allocating params!\n");
+		pkg_free(extra_headers.s);
+		free_tm_dlg(dialog_info);
+		return -1;
+	}
+	memset(p, 0, sizeof *p);
+	p->is_prack = 1;
+	p->dlg = dlg;
+	p->func = func;
+	p->param = param;
+	p->release = release;
+	p->leg = dstleg;
+
+	auto_prack_ctx = dlg_build_auto_prack_ctx(rpl);
+	if (!auto_prack_ctx)
+		LM_ERR("failed to build internal auto PRACK correlation context\n");
+	else {
+		LM_DBG("built internal auto PRACK correlation context for INVITE tid <%.*s>, to-tag <%.*s>\n",
+			auto_prack_ctx->invite_tid.len, auto_prack_ctx->invite_tid.s,
+			auto_prack_ctx->invite_totag.len, auto_prack_ctx->invite_totag.s);
+		dialog_info->t_created_cb = dlg_auto_prack_t_created;
+		dialog_info->t_created_cb_param = auto_prack_ctx;
+	}
+
+	if (push_new_processing_context(dlg, &old_ctx, &new_ctx, NULL) != 0) {
+		pkg_free(extra_headers.s);
+		free_tm_dlg(dialog_info);
+		shm_free(p);
+		if (auto_prack_ctx)
+			shm_free(auto_prack_ctx);
+		return -1;
+	}
+
+	ctx_lastdstleg_set(dstleg);
+	dialog_info->T_flags = T_NO_AUTOACK_FLAG;
+
+	ref_dlg(dlg, 1);
+	result = d_tmb.t_request_within(&method, &extra_headers, body, dialog_info,
+			dlg_indialog_reply, p, dlg_indialog_reply_release);
+
+	if (current_processing_ctx == NULL)
+		*new_ctx = NULL;
+	else
+		context_destroy(CONTEXT_GLOBAL, *new_ctx);
+	set_global_context(old_ctx);
+
+	pkg_free(extra_headers.s);
+	free_tm_dlg(dialog_info);
+
+	if (dialog_repl_cluster)
+		replicate_dialog_cseq_updated(dlg, dstleg);
+
+	if (result < 0) {
+		LM_ERR("failed to send the PRACK request\n");
+		unref_dlg(dlg, 1);
+		shm_free(p);
+		if (auto_prack_ctx)
+			shm_free(auto_prack_ctx);
+		return -1;
+	}
+
 	return 0;
 }
 

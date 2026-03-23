@@ -39,6 +39,7 @@
 #include "../../script_var.h"
 #include "../../mem/mem.h"
 #include "../../mi/mi.h"
+#include "../../lib/csv.h"
 #include "../rr/api.h"
 #include "../../bin_interface.h"
 #include "../clusterer/api.h"
@@ -77,6 +78,8 @@ int dlg_del_delay = 0;               /* in seconds, default off */
 str dlg_extra_hdrs = {NULL,0};
 int race_condition_timeout = 5; /* seconds until call termination is triggered,
 					after 200OK -> CANCEL race detection */
+int auto_prack_hangup_on_failure = 0;
+int auto_prack_fr_timeout = 3;
 
 /* statistic variables */
 int dlg_enable_stats = 1;
@@ -118,7 +121,7 @@ static int pv_get_dlg_count( struct sip_msg *msg, pv_param_t *param,
 		pv_value_t *res);
 
 /* commands wrappers and fixups */
-static int w_create_dialog(struct sip_msg*, str *flags_str);
+static int w_create_dialog(struct sip_msg*, void *flags_param);
 static int w_match_dialog(struct sip_msg *msg, void *seq_match_mode_val);
 static int api_match_dialog(struct sip_msg *msg, int _seq_match_mode);
 static int w_validate_dialog(struct sip_msg*);
@@ -134,6 +137,7 @@ static int fixup_check_avp(void** param);
 static int fixup_check_var(void** param);
 static int fixup_lmode(void **param);
 static int fixup_leg(void **param);
+static int fixup_create_dlg_flags(void **param);
 static int w_set_dlg_flag(struct sip_msg *msg, void *mask);
 static int w_reset_dlg_flag(struct sip_msg *msg, void *mask);
 static int w_is_dlg_flag_set(struct sip_msg *msg, void *mask);
@@ -186,7 +190,7 @@ int pv_get_dlg_ctx_json(struct sip_msg *msg, pv_param_t *param,
 
 static const cmd_export_t cmds[]={
 	{"create_dialog", (cmd_function)w_create_dialog, {
-		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+		{CMD_PARAM_STR|CMD_PARAM_OPT,fixup_create_dlg_flags,0}, {0,0,0}},
 		REQUEST_ROUTE},
 	{"set_dlg_profile", (cmd_function)w_set_dlg_profile, {
 		{CMD_PARAM_STR,0,0},
@@ -303,6 +307,8 @@ static const param_export_t mod_params[]={
 	{ "delete_delay",          INT_PARAM, &dlg_del_delay            },
 	{ "dlg_extra_hdrs",        STR_PARAM, &dlg_extra_hdrs.s         },
 	{ "dlg_match_mode",        INT_PARAM, &seq_match_mode           },
+	{ "auto_prack_hangup_on_failure", INT_PARAM, &auto_prack_hangup_on_failure },
+	{ "auto_prack_fr_timeout", INT_PARAM, &auto_prack_fr_timeout },
 	{ "db_url",                STR_PARAM, &db_url.s                 },
 	{ "db_mode",               INT_PARAM, &dlg_db_mode              },
 	{ "table_name",            STR_PARAM, &dialog_table_name        },
@@ -596,6 +602,64 @@ static int free_fixup_route(void** param)
 {
 	if (*param)
 		unref_script_route( (struct script_route_ref *)*param );
+	return 0;
+}
+
+/*
+ * Keep this array in sync with create_dlg_flags[] below: if you add, remove
+ * or reorder a create_dialog() flag here, make the identical change there.
+ */
+static str create_dlg_flag_names[] = {
+	str_init("bye-on-timeout"),       /* DLG_FLAG_BYEONTIMEOUT */
+	str_init("options-ping-caller"),  /* DLG_FLAG_PING_CALLER */
+	str_init("options-ping-callee"),  /* DLG_FLAG_PING_CALLEE */
+	str_init("reinvite-ping-caller"), /* DLG_FLAG_REINVITE_PING_CALLER */
+	str_init("reinvite-ping-callee"), /* DLG_FLAG_REINVITE_PING_CALLEE */
+	str_init("end-on-race-condition"), /* DLG_FLAG_END_ON_RACE_CONDITION */
+	str_init("auto-prack"),           /* DLG_FLAG_AUTOPRACK */
+	STR_NULL
+};
+
+static int fixup_create_dlg_flags(void **param)
+{
+	static const unsigned int create_dlg_flags[] = {
+		DLG_FLAG_BYEONTIMEOUT,
+		DLG_FLAG_PING_CALLER,
+		DLG_FLAG_PING_CALLEE,
+		DLG_FLAG_REINVITE_PING_CALLER,
+		DLG_FLAG_REINVITE_PING_CALLEE,
+		DLG_FLAG_END_ON_RACE_CONDITION,
+		DLG_FLAG_AUTOPRACK
+	};
+	str *flags_str = (str *)*param;
+	csv_record *list, *rec;
+	unsigned int flags = 0;
+	int i;
+
+	list = parse_csv_record(flags_str);
+	if (!list) {
+		LM_ERR("Failed to parse list of create_dialog flags\n");
+		return -1;
+	}
+
+	for (rec = list; rec; rec = rec->next) {
+		for (i = 0; create_dlg_flag_names[i].s; i++) {
+			if (str_strcasecmp(&rec->s, &create_dlg_flag_names[i]) == 0) {
+				flags |= create_dlg_flags[i];
+				break;
+			}
+		}
+
+		if (!create_dlg_flag_names[i].s) {
+			LM_ERR("Unknown create_dialog flag: %.*s\n",
+				rec->s.len, rec->s.s);
+			free_csv_record(list);
+			return -1;
+		}
+	}
+
+	free_csv_record(list);
+	*param = (void *)(unsigned long)flags;
 	return 0;
 }
 
@@ -1008,12 +1072,12 @@ static void mod_destroy(void)
 }
 
 
-static int w_create_dialog(struct sip_msg *req, str *flags_str)
+static int w_create_dialog(struct sip_msg *req, void *flags_param)
 {
 	struct cell *t;
-	int flags;
+	unsigned int flags;
 
-	flags = flags_str? parse_create_dlg_flags(flags_str): 0;
+	flags = flags_param ? (unsigned int)(unsigned long)flags_param : 0;
 
 	/* don't allow both Re-INVITE and OPTIONS pinging */
 	if ((flags & (DLG_FLAG_PING_CALLER|DLG_FLAG_REINVITE_PING_CALLER)) ==
@@ -2567,6 +2631,10 @@ static int dlg_send_sequential(struct sip_msg* msg, str *method, int leg,
 {
 	struct dlg_cell *dlg = get_current_dialog();
 	str invite = str_init("INVITE");
+	str prack = str_init("PRACK");
+	str req_headers = {0, 0};
+	int rc;
+	int is_prack = 0;
 
 	if (!dlg) {
 		LM_WARN("no current dialog found. Make sure you call this "
@@ -2575,13 +2643,32 @@ static int dlg_send_sequential(struct sip_msg* msg, str *method, int leg,
 	}
 	if (!method)
 		method = &invite;
+	else if (method->len == prack.len && strncasecmp(method->s, prack.s, prack.len) == 0)
+		is_prack = 1;
 
 	if (body && !ct)
 		LM_WARN("body without content type! This request might be rejected by uac!\n");
 
-	return send_indialog_request(dlg, method, (leg == DLG_CALLER_LEG?leg:callee_idx(dlg)),
-			body, ct, headers, NULL, NULL, NULL) == 0?1:-1;
+	if (is_prack) {
+		rc = dlg_prepare_prack_headers(msg, headers, &req_headers, 0);
+		if (rc < 0)
+			return rc;
+	}
 
+	if (is_prack && msg && msg->first_line.type == SIP_REPLY)
+		rc = send_prack_indialog_request(dlg, msg,
+				(leg == DLG_CALLER_LEG ? leg : callee_idx(dlg)), body, ct,
+				(req_headers.s ? &req_headers : headers), NULL, NULL, NULL);
+	else
+		rc = send_indialog_request(dlg, method,
+				(leg == DLG_CALLER_LEG ? leg : callee_idx(dlg)),
+				body, ct, (req_headers.s ? &req_headers : headers),
+				NULL, NULL, NULL);
+
+	if (req_headers.s)
+		pkg_free(req_headers.s);
+
+	return rc == 0 ? 1 : -1;
 }
 
 static int dlg_inc_cseq(struct sip_msg *msg, str *tag, int *_count)

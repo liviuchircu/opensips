@@ -69,6 +69,7 @@
 #define DLG_FLAG_RACE_CONDITION_OCCURRED	(1<<17)
 #define DLG_FLAG_SELF_EXTENDED_TIMEOUT		(1<<18)
 #define DLG_FLAG_SYNCED                     (1<<19)
+#define DLG_FLAG_AUTOPRACK			(1<<20)
 
 #define dlg_has_options_pinging(dlg) \
 	(dlg->flags & DLG_FLAG_PING_CALLER || \
@@ -347,50 +348,6 @@ void destroy_dlg(struct dlg_cell *dlg);
 				(_dlg)->del_delay?(_dlg)->del_delay:dlg_del_delay); \
 		}\
 	}while(0)
-
-/*
- * @input - str
- * @return - integer flag bitmask
- */
-#define parse_create_dlg_flags(input) \
-	({ \
-		char *___p; \
-		int ___flags = 0; \
-		for (___p=(input)->s; ___p < (input)->s + (input)->len; ___p++) \
-		{ \
-			switch (*___p) \
-			{ \
-				case 'P': \
-					___flags |= DLG_FLAG_PING_CALLER; \
-					LM_DBG("will ping caller\n"); \
-					break; \
-				case 'p': \
-					___flags |= DLG_FLAG_PING_CALLEE; \
-					LM_DBG("will ping callee\n"); \
-					break; \
-				case 'B': \
-					___flags |= DLG_FLAG_BYEONTIMEOUT; \
-					LM_DBG("bye on timeout activated\n"); \
-					break; \
-				case 'R': \
-					___flags |= DLG_FLAG_REINVITE_PING_CALLER; \
-					LM_DBG("re-invite ping caller activated\n"); \
-					break; \
-				case 'r': \
-					___flags |= DLG_FLAG_REINVITE_PING_CALLEE; \
-					LM_DBG("re-invite ping callee activated\n"); \
-					break; \
-				case 'E': \
-					___flags |= DLG_FLAG_END_ON_RACE_CONDITION; \
-					LM_DBG("ending call on 200OK race conditions \n"); \
-					break; \
-				default: \
-					LM_DBG("unknown create_dialog flag : [%c] ." \
-						   "Skipping\n", *___p); \
-			} \
-		} \
-		___flags; \
-	})
 
 int dialog_cleanup( struct sip_msg *msg, void *param );
 
